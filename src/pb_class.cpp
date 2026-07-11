@@ -2224,11 +2224,11 @@ poisson_boltzmann::assemble_newton_system (ray_cache_t & ray_cache,
       extra_data[i] = 0.0;
       continue;
     }
-
+    
     const double ch = std::cosh (ui);
     const double sh = std::sinh (ui);
     cosh_data[i]  = Ci * ch;
-    extra_data[i] = Ci * (ui * ch - sh);
+    extra_data[i] = Ci * (ui * ch - sh); 
   }
 
   if (size > 1) {
@@ -2313,12 +2313,26 @@ poisson_boltzmann::newton_solve (ray_cache_t & ray_cache)
     else
       lis_compute_electric_potential (ray_cache);
 
-    // Convergence: max-norm of the update over all ranks.
+    auto & phi_full = phi->get_owned_data ();
+
+    bool local_bad = false;
+    for (std::size_t i = 0; i < n; ++i)
+      if (!std::isfinite (phi_full[i])) local_bad = true;
+
     double local_du = 0.0;
-    auto & phi_new = phi->get_owned_data ();
     for (std::size_t i = 0; i < n; ++i) {
-      const double d = std::fabs (phi_new[i] - phi_old[i]);
+      const double d = std::fabs (phi_full[i] - phi_old[i]);
       if (d > local_du) local_du = d;
+    }
+
+    int global_bad = local_bad ? 1 : 0;
+    if (size > 1)
+      MPI_Allreduce (MPI_IN_PLACE, &global_bad, 1, MPI_INT, MPI_MAX, mpicomm);
+    if (global_bad) {
+      if (rank == 0)
+        std::cout << "  [Newton] DIVERGED (non-finite solution) at iter "
+                  << it << std::endl;
+      break;
     }
 
     double global_du = local_du;
