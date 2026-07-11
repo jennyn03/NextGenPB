@@ -224,15 +224,18 @@ main (int argc, char **argv)
     std::cout << "\n========== [ Assemble Matricies ] ==========\n";
     std::cout << "Selected BCs          : ";
 
-    if (pb.bc ==1)
-      std::cout << "Null\n";
-    else if (pb.bc ==2)
+    if (pb.bc == 1)
+      std::cout << "Null (homogeneous Dirichlet)\n";
+    else if (pb.bc == 2)
       std::cout << "Coulombic\n";
+    else if (pb.bc == 3)
+      std::cout << "Analytic (sphere test)\n";
     else
       std::cout << "Neumann\n";
   }
 
-  pb.assemple_system_matrix (ray_cache);
+  if (pb.linearized == 1)
+    pb.assemple_system_matrix (ray_cache);
 
   if (rank == 0)
     std::cout << "============================================\n";
@@ -243,7 +246,12 @@ main (int argc, char **argv)
 
   TIC ();
 
-  if (pb.linear_solver_name == "mumps") {
+  if (pb.linearized == 0) {
+    if (rank == 0)
+      std::cout << "\n== [ Starting NONLINEAR solution: Newton on sinh ] ==\n";
+
+    pb.newton_solve (ray_cache);
+  } else if (pb.linear_solver_name == "mumps") {
     if (rank == 0)
       std::cout << "\n== [ Starting numerical solution using MUMPS ] ==\n";
 
@@ -257,7 +265,6 @@ main (int argc, char **argv)
     std::cerr << "Invalid linear solver selected" << std::endl;
     return 1;
   }
-
   if (rank == 0)
     std::cout << "============================================\n";
 

@@ -2163,6 +2163,187 @@ poisson_boltzmann::assemple_system_matrix (ray_cache_t & ray_cache)
   }
 }
 
+// ============================================================
+//  Newton assembly: build J(phi) and RHS for ONE Newton step
+//  Nonlinear PBE:  -div(eps grad phi) + C * sinh(phi) = rho_fixed
+//    where C = reaction_nodes (== 0 inside the molecule).
+//  "Full" Newton form (BCs identical to the linear case):
+//    [ A_stiff + M[C*cosh(phi)] ] phi_new
+//        = rho_load + M[ C*(phi*cosh(phi) - sinh(phi)) ]
+//  NOTE: does NOT free rho_fixed / reaction_nodes / ones / const_ones,
+//        because the Newton loop reuses them every iteration.
+//  NOTE: non-Stern path only (stern_layer_surf == 0).
+// ============================================================
+void
+poisson_boltzmann::assemble_newton_system (ray_cache_t & ray_cache,
+                                           distributed_vector & phi_cur)
+{
+  int size, rank;
+  MPI_Comm_size (mpicomm, &size);
+  MPI_Comm_rank (mpicomm, &rank);
+
+  // The operators sweep all 8 local nodes (incl. ghosts), so make
+  // sure the current iterate's ghost values are up to date first.
+  if (size > 1)
+    bim3a_solution_with_ghosts (tmsh, phi_cur, replace_op);
+
+  // Same cut-cell helper as the linear assembly.
+  auto func_frac = [&] (tmesh_3d::quadrant_iterator& quadrant) {
+    return cube_fraction_intersection (quadrant, ray_cache);
+  };
+
+  // Fresh matrix + rhs for this Newton iteration.
+  A = std::make_unique<distributed_sparse_matrix> (mpicomm);
+  A->set_ranges (tmsh.num_owned_nodes());
+  rhs = std::make_unique<distributed_vector> (tmsh.num_owned_nodes(), mpicomm);
+
+  // --- unchanged fixed-charge load  b = M * rho_fixed ---
+  bim3a_rhs (tmsh, const_ones, *rho_fixed, *rhs);
+
+  // --- build nodal Newton coefficients from the current iterate ---
+  // C = reaction_nodes (nodal reaction coefficient, 0 inside molecule)
+  const std::size_t n = tmsh.num_owned_nodes();
+
+  distributed_vector cosh_coeff (tmsh.num_owned_nodes(), mpicomm); // C*cosh(phi)
+  distributed_vector rhs_extra  (tmsh.num_owned_nodes(), mpicomm); // C*(phi*cosh(phi)-sinh(phi))
+
+  auto & C_data     = reaction_nodes->get_owned_data ();
+  auto & phi_data   = phi_cur.get_owned_data ();
+  auto & cosh_data  = cosh_coeff.get_owned_data ();
+  auto & extra_data = rhs_extra.get_owned_data ();
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const double Ci = C_data[i];
+    const double ui = phi_data[i];
+
+    // The ionic term lives only where C != 0 (the solvent). Inside the
+    // molecule C == 0, and the potential there can be huge near the point
+    // charge -> cosh/sinh would overflow and 0*inf = NaN. So skip them.
+    if (Ci == 0.0) {
+      cosh_data[i]  = 0.0;
+      extra_data[i] = 0.0;
+      continue;
+    }
+
+    const double ch = std::cosh (ui);
+    const double sh = std::sinh (ui);
+    cosh_data[i]  = Ci * ch;
+    extra_data[i] = Ci * (ui * ch - sh);
+  }
+
+  if (size > 1) {
+    bim3a_solution_with_ghosts (tmsh, cosh_coeff, replace_op);
+    bim3a_solution_with_ghosts (tmsh, rhs_extra,  replace_op);
+  }
+
+  // Add extra RHS term  M * [ C (phi cosh phi - sinh phi) ].
+  bim3a_rhs (tmsh, const_ones, rhs_extra, *rhs);
+
+  // --- stiffness  -div(eps grad .), identical to the linear case ---
+  bim3a_laplacian_frac (tmsh, *epsilon_nodes, *A, func_frac);
+
+  // --- Jacobian reaction term with coefficient C*cosh(phi) ---
+  bim3a_reaction_frac (tmsh, cosh_coeff, *ones, *A, func_frac);
+
+  // --- Dirichlet BCs: identical to assemple_system_matrix ---
+  dirichlet_bcs3 bcs;
+  if (bc == 1) {
+    for (auto const& ibc : bcells)
+      bcs.emplace_back (ibc.first, ibc.second,
+                        [] (double, double, double) { return 0.0; });
+    bim3a_dirichlet_bc (tmsh, bcs, *A, *rhs);
+  }
+  if (bc == 2) {
+    for (auto const& ibc : bcells)
+      bcs.emplace_back (ibc.first, ibc.second,
+                        [&] (double x, double y, double z) {
+                          return coulomb_boundary_conditions (x, y, z); });
+    bim3a_dirichlet_bc (tmsh, bcs, *A, *rhs);
+  }
+  if (bc == 3) {
+    for (auto const& ibc : bcells)
+      bcs.emplace_back (ibc.first, ibc.second,
+                        [&] (double x, double y, double z) {
+                          return analytic_solution (x, y, z); });
+    bim3a_dirichlet_bc (tmsh, bcs, *A, *rhs);
+  }
+
+  if (size > 1) {
+    A->assemble();
+    rhs->assemble();
+  }
+}
+
+// ============================================================
+//  Newton driver: repeatedly linearize and solve until converged.
+//  Starts from phi = 0, so iteration 0 reproduces the linear solve.
+// ============================================================
+void
+poisson_boltzmann::newton_solve (ray_cache_t & ray_cache)
+{
+  int size, rank;
+  MPI_Comm_size (mpicomm, &size);
+  MPI_Comm_rank (mpicomm, &rank);
+
+  const int    newton_max_iter = 50;
+  const double newton_tol      = 1.0e-6;
+
+  const std::size_t n = tmsh.num_owned_nodes ();
+
+  // Initial guess phi^0 = 0.
+  phi = std::make_unique<distributed_vector> (n, mpicomm);
+  phi->get_owned_data ().assign (n, 0.0);
+  if (size > 1)
+    bim3a_solution_with_ghosts (tmsh, *phi, replace_op);
+
+  std::vector<double> phi_old (n, 0.0);
+
+  for (int it = 0; it < newton_max_iter; ++it) {
+    // Save current iterate (owned part) for the convergence test.
+    auto & phi_now = phi->get_owned_data ();
+    for (std::size_t i = 0; i < n; ++i)
+      phi_old[i] = phi_now[i];
+
+    // Build J(phi) and the Newton RHS from the current iterate.
+    assemble_newton_system (ray_cache, *phi);
+
+    // Solve  J * phi_new = rhs   (writes the result into *phi).
+    if (linear_solver_name == "mumps")
+      mumps_compute_electric_potential (ray_cache);
+    else
+      lis_compute_electric_potential (ray_cache);
+
+    // Convergence: max-norm of the update over all ranks.
+    double local_du = 0.0;
+    auto & phi_new = phi->get_owned_data ();
+    for (std::size_t i = 0; i < n; ++i) {
+      const double d = std::fabs (phi_new[i] - phi_old[i]);
+      if (d > local_du) local_du = d;
+    }
+
+    double global_du = local_du;
+    if (size > 1)
+      MPI_Allreduce (&local_du, &global_du, 1, MPI_DOUBLE, MPI_MAX, mpicomm);
+
+    if (rank == 0)
+      std::cout << "  [Newton] iter " << it
+                << "   ||du||_inf = " << global_du << std::endl;
+
+    if (!std::isfinite (global_du)) {
+      if (rank == 0)
+        std::cout << "  [Newton] DIVERGED (non-finite update) at iter "
+                  << it << std::endl;
+      break;
+    }
+
+    if (it >= 1 && global_du < newton_tol) {
+      if (rank == 0)
+        std::cout << "  [Newton] converged in " << it + 1
+                  << " iterations." << std::endl;
+      break;
+    }
+  }
+}
 
 void
 poisson_boltzmann::export_tmesh (ray_cache_t & ray_cache)
