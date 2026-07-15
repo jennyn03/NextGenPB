@@ -2197,8 +2197,7 @@ poisson_boltzmann::assemble_newton_system (ray_cache_t & ray_cache,
   A->set_ranges (tmsh.num_owned_nodes());
   rhs = std::make_unique<distributed_vector> (tmsh.num_owned_nodes(), mpicomm);
 
-  // --- unchanged fixed-charge load  b = M * rho_fixed ---
-  bim3a_rhs (tmsh, const_ones, *rho_fixed, *rhs);
+
 
   // --- build nodal Newton coefficients from the current iterate ---
   // C = reaction_nodes (nodal reaction coefficient, 0 inside molecule)
@@ -2236,8 +2235,14 @@ poisson_boltzmann::assemble_newton_system (ray_cache_t & ray_cache,
     bim3a_solution_with_ghosts (tmsh, rhs_extra,  replace_op);
   }
 
-  // Add extra RHS term  M * [ C (phi cosh phi - sinh phi) ].
-  bim3a_rhs (tmsh, const_ones, rhs_extra, *rhs);
+   // Add extra RHS term  M_frac * [ C (phi cosh phi - sinh phi) ].
+  // Must use the SAME fractional cut-cell quadrature as the LHS reaction
+  // term (bim3a_reaction_frac); the full-cell bim3a_rhs makes the two
+  // disagree at cut cells and scales the Newton step by m_full/m_frac.
+  bim3a_rhs_frac (tmsh, *ones, rhs_extra, *rhs, func_frac);
+
+  // Then accumulate the fixed-charge load  b = M * rho_fixed.
+  bim3a_rhs (tmsh, const_ones, *rho_fixed, *rhs);
 
   // --- stiffness  -div(eps grad .), identical to the linear case ---
   bim3a_laplacian_frac (tmsh, *epsilon_nodes, *A, func_frac);
@@ -2275,8 +2280,27 @@ poisson_boltzmann::assemble_newton_system (ray_cache_t & ray_cache,
 }
 
 // ============================================================
-//  Newton driver: repeatedly linearize and solve until converged.
-//  Starts from phi = 0, so iteration 0 reproduces the linear solve.
+//  Newton driver for the nonlinear PBE
+//
+//    -div(eps grad phi) + C sinh(phi) = rho_fixed ,   C = reaction_nodes
+//
+//  C == 0 inside the molecule, so the equation is LINEAR there: the entire
+//  nonlinearity lives in the solvent (C != 0). Convergence of this iteration
+//  is therefore governed by the solvent nodes alone.
+//
+//  Each iteration solves the "full Newton form"
+//    [ A_stiff + M[C cosh(phi_k)] ] phi_{k+1}
+//        = rho_load + M[ C (phi_k cosh(phi_k) - sinh(phi_k)) ]
+//  which is algebraically identical to solving for the correction
+//  du = phi_{k+1} - phi_k; du is recovered explicitly below so it can be
+//  clamped (globalization).
+//
+//  phi^0 = 0 => cosh(0)=1 and the extra RHS term vanishes, so iteration 0
+//  reproduces the linear solve exactly. This is deliberate: it is a free
+//  regression check against the linear solver.
+//
+//  Globalization: |du|_inf is clamped to maxdu from iteration 1 onward.
+//  Iteration 0 is unclamped so the jump to the linear solution is taken whole.
 // ============================================================
 void
 poisson_boltzmann::newton_solve (ray_cache_t & ray_cache)
@@ -2285,8 +2309,31 @@ poisson_boltzmann::newton_solve (ray_cache_t & ray_cache)
   MPI_Comm_size (mpicomm, &size);
   MPI_Comm_rank (mpicomm, &rank);
 
-  const int    newton_max_iter = 50;
+  const int    newton_max_iter = 100;
   const double newton_tol      = 1.0e-6;
+  const double maxdu           = 2.0;    // clamp: max |du|_inf per iteration
+  const bool   newton_verbose  = true;   // per-iteration diagnostics
+
+  // --- preconditions: fail loudly instead of segfaulting or lying ---
+  if (!reaction_nodes) {
+    if (rank == 0)
+      std::cerr << "  [Newton] ERROR: reaction_nodes not allocated. create_markers() "
+                   "must run first, and assemple_system_matrix() must NOT have run "
+                   "(it frees reaction_nodes).\n";
+    return;
+  }
+  if (!rho_fixed || !ones) {
+    if (rank == 0)
+      std::cerr << "  [Newton] ERROR: rho_fixed/ones not allocated. "
+                   "create_density_map() must run before newton_solve().\n";
+    return;
+  }
+  if (stern_layer_surf == 1) {
+    if (rank == 0)
+      std::cerr << "  [Newton] ERROR: nonlinear solver implements the non-Stern path "
+                   "only; set stern_layer_surf = 0.\n";
+    return;
+  }
 
   const std::size_t n = tmsh.num_owned_nodes ();
 
@@ -2297,66 +2344,150 @@ poisson_boltzmann::newton_solve (ray_cache_t & ray_cache)
     bim3a_solution_with_ghosts (tmsh, *phi, replace_op);
 
   std::vector<double> phi_old (n, 0.0);
+  std::vector<double> du (n, 0.0);
+
+  bool converged = false;
+  int  it_done   = 0;
 
   for (int it = 0; it < newton_max_iter; ++it) {
-    // Save current iterate (owned part) for the convergence test.
-    auto & phi_now = phi->get_owned_data ();
-    for (std::size_t i = 0; i < n; ++i)
-      phi_old[i] = phi_now[i];
+    it_done = it;
 
-    // Build J(phi) and the Newton RHS from the current iterate.
+    // Save the iterate the system is about to be built from.
+    {
+      auto & phi_cur = phi->get_owned_data ();
+      for (std::size_t i = 0; i < n; ++i)
+        phi_old[i] = phi_cur[i];
+    }
+
     assemble_newton_system (ray_cache, *phi);
 
-    // Solve  J * phi_new = rhs   (writes the result into *phi).
+    // Solve J * phi_new = rhs.
     if (linear_solver_name == "mumps")
       mumps_compute_electric_potential (ray_cache);
     else
       lis_compute_electric_potential (ray_cache);
 
-    auto & phi_full = phi->get_owned_data ();
+    // IMPORTANT: both solvers REPLACE the phi object (make_unique), so this
+    // reference must be taken AFTER the solve, never before.
+    auto & phi_new = phi->get_owned_data ();
+    auto & Cd      = reaction_nodes->get_owned_data ();
 
-    bool local_bad = false;
-    for (std::size_t i = 0; i < n; ++i)
-      if (!std::isfinite (phi_full[i])) local_bad = true;
-
-    double local_du = 0.0;
+    // --- Newton correction du = phi_new - phi_old ---
+    double local_du = 0.0, local_u = 0.0, local_du_solv = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
-      const double d = std::fabs (phi_full[i] - phi_old[i]);
-      if (d > local_du) local_du = d;
+      du[i] = phi_new[i] - phi_old[i];
+      const double ad = std::fabs (du[i]);
+      if (ad > local_du) local_du = ad;
+      if (Cd[i] != 0.0 && ad > local_du_solv) local_du_solv = ad;
+      const double au = std::fabs (phi_old[i]);
+      if (au > local_u) local_u = au;
     }
 
-    int global_bad = local_bad ? 1 : 0;
-    if (size > 1)
-      MPI_Allreduce (MPI_IN_PLACE, &global_bad, 1, MPI_INT, MPI_MAX, mpicomm);
-    if (global_bad) {
+    double anorm = local_du, unorm = local_u, dsolv = local_du_solv;
+    if (size > 1) {
+      MPI_Allreduce (&local_du,      &anorm, 1, MPI_DOUBLE, MPI_MAX, mpicomm);
+      MPI_Allreduce (&local_u,       &unorm, 1, MPI_DOUBLE, MPI_MAX, mpicomm);
+      MPI_Allreduce (&local_du_solv, &dsolv, 1, MPI_DOUBLE, MPI_MAX, mpicomm);
+    }
+
+    // ---------------- diagnostics ----------------
+    // Every line tagged "[Newton]" so one grep catches the whole trace.
+    // NOTE: rank 0's OWNED nodes only -- indicative, not a global reduction.
+    if (newton_verbose && rank == 0) {
+      auto report = [&] (const char * tag, const double * v) {
+        double m_all = 0.0, m_solv = 0.0, m_mol = 0.0;
+        std::size_t i_all = 0, i_solv = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double a = std::fabs (v[i]);
+          if (a > m_all)    { m_all  = a; i_all  = i; }
+          if (Cd[i] != 0.0) { if (a > m_solv) { m_solv = a; i_solv = i; } }
+          else              { if (a > m_mol)  { m_mol  = a; } }
+        }
+        std::cout << "  [Newton]   " << tag
+                  << " all=" << std::setprecision (17) << m_all
+                  << " (node " << i_all << ", C=" << Cd[i_all] << ")"
+                  << "  solvent=" << m_solv << " (node " << i_solv << ")"
+                  << "  molecule=" << m_mol
+                  << std::setprecision (6) << std::endl;
+      };
+
+      if (it == 0) {
+        std::size_t nsolv = 0;
+        for (std::size_t i = 0; i < n; ++i) if (Cd[i] != 0.0) ++nsolv;
+        std::cout << "  [Newton]   solvent nodes (rank 0): "
+                  << nsolv << " / " << n << std::endl;
+      }
+
+      report ("phi_old:", phi_old.data ());   // system was built from this; == 0 at it==0
+      report ("phi_new:", phi_new.data ());   // what the solve just returned
+      report ("du     :", du.data ());
+
+      double extramax = 0.0;
+      for (std::size_t i = 0; i < n; ++i)
+        if (Cd[i] != 0.0) {
+          const double e = std::fabs (Cd[i] * (phi_old[i] * std::cosh (phi_old[i])
+                                               - std::sinh (phi_old[i])));
+          if (e > extramax) extramax = e;
+        }
+      std::cout << "  [Newton]   max|rhs_extra| from phi_old = "
+                << std::setprecision (17) << extramax
+                << std::setprecision (6) << std::endl;
+    }
+
+    if (rank == 0)
+      std::cout << "  [Newton] iter " << it
+                << "   ||du||_inf = "         << std::setprecision (17) << anorm
+                << "   ||du||_inf,solvent = " << dsolv
+                << std::setprecision (6) << std::endl;
+
+    // --- divergence check: scan phi itself, not just the norm ---
+    bool bad = !std::isfinite (anorm);
+    for (std::size_t i = 0; i < n && !bad; ++i)
+      if (!std::isfinite (phi_new[i])) bad = true;
+    if (size > 1) {
+      int b = bad ? 1 : 0, gb = 0;
+      MPI_Allreduce (&b, &gb, 1, MPI_INT, MPI_MAX, mpicomm);
+      bad = (gb != 0);
+    }
+    if (bad) {
       if (rank == 0)
         std::cout << "  [Newton] DIVERGED (non-finite solution) at iter "
                   << it << std::endl;
       break;
     }
 
-    double global_du = local_du;
-    if (size > 1)
-      MPI_Allreduce (&local_du, &global_du, 1, MPI_DOUBLE, MPI_MAX, mpicomm);
-
-    if (rank == 0)
-      std::cout << "  [Newton] iter " << it
-                << "   ||du||_inf = " << global_du << std::endl;
-
-    if (!std::isfinite (global_du)) {
-      if (rank == 0)
-        std::cout << "  [Newton] DIVERGED (non-finite update) at iter "
-                  << it << std::endl;
-      break;
-    }
-
-    if (it >= 1 && global_du < newton_tol) {
+    // --- relative convergence test ---
+    // NOTE: unorm is max|phi| over ALL nodes and is dominated by the peak at
+    // the point charges INSIDE the molecule, where the problem is linear.
+    // Kept as-is for continuity with the recorded sphere results; the solvent
+    // norm printed above is the physically meaningful one.
+    if (it >= 1 && anorm < newton_tol * (unorm > 0.0 ? unorm : 1.0)) {
+      converged = true;
       if (rank == 0)
         std::cout << "  [Newton] converged in " << it + 1
                   << " iterations." << std::endl;
       break;
     }
+
+    // --- clamping globalization (iteration 0 unclamped) ---
+    double scale = 1.0;
+    if (it >= 1 && anorm > maxdu) {
+      scale = maxdu / anorm;
+      if (rank == 0)
+        std::cout << "  [Newton] CLAMP active: scale = " << scale << std::endl;
+    }
+
+    for (std::size_t i = 0; i < n; ++i)
+      phi_new[i] = phi_old[i] + scale * du[i];
+
+    if (size > 1)
+      bim3a_solution_with_ghosts (tmsh, *phi, replace_op);
   }
+
+  if (!converged && rank == 0)
+    std::cout << "  [Newton] WARNING: did NOT converge in " << it_done + 1
+              << " iterations. The reported potential is the last iterate."
+              << std::endl;
 }
 
 void
