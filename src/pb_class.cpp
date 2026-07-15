@@ -3869,11 +3869,21 @@ poisson_boltzmann::coulomb_boundary_conditions (double x, double y, double z)
   double pot = 0.0;
   double k = std::sqrt (k2);
 
-  for (const NS::Atom& i : atoms) {
-    dist = std::hypot ( (i.pos[0] - x), (i.pos[1] - y), (i.pos[2] - z));
-    pot += i.charge*exp (-k*dist)/ (dist*eps_out);
+  
+  if (pos_atoms.size () != charge_atoms.size ()) {
+    return 0.0;
   }
 
+  for (std::size_t i = 0; i < charge_atoms.size (); ++i) {
+    dist = std::hypot (pos_atoms[i][0] - x,
+                      pos_atoms[i][1] - y,
+                      pos_atoms[i][2] - z);
+
+    if (dist > 1.0e-12) {
+      pot += charge_atoms[i] * std::exp (-k * dist)
+            / (dist * eps_out);
+    }
+  }
   return pot;
 }
 
