@@ -257,14 +257,24 @@ The expected linear electrostatic energy is approximately:
 
 The current nonlinear implementation:
 
-- uses an undamped Newton method;
-- does not implement a line search or continuation strategy;
+- uses a clamped Newton method (globalization via step-size limiting,
+  `maxdu` in `newton_solve()`) rather than a full line search or
+  continuation strategy;
+- energy computation is intentionally **not implemented** for the
+  nonlinear model — the energy functional is a linear-response
+  quantity and isn't meaningful applied to a nonlinear `phi`; the code
+  detects this and skips it with a warning instead of computing a
+  wrong number;
 - supports the configuration without a Stern layer;
 - has not been compared with an independent nonlinear reference solver;
 - may fail to converge for strongly charged configurations.
 
 Exploratory tests with charges `q = 5` and `q = 10` did not converge
 within the maximum number of Newton iterations.
+
+See `REPRODUCE.md` for step-by-step instructions to reproduce our
+course project results (real-molecule test, clamping demonstration,
+and weak/strong scalability tests).
 
 
 # Documentation & Tutorials
